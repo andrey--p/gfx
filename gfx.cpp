@@ -85,6 +85,13 @@ __declspec(dllexport) UINT GetD3D12SDKVersion()
 }
 }
 
+struct GfxLinearAlgebraOpSupport
+{
+    GfxLinearAlgebraMultiplySupport multiply{};
+    bool outer_product_supported = false;
+    GfxLinearAlgebraAccumulationSupport accumulation{};
+};
+
 class GfxInternal
 {
     GFX_NON_COPYABLE(GfxInternal);
@@ -104,6 +111,10 @@ class GfxInternal
     ID3D12GraphicsCommandList6 *mesh_command_list_ = nullptr;
     ID3D12CommandAllocator **command_allocators_ = nullptr;
     ID3D12DebugCommandList *dbg_command_list_ = nullptr;
+    ID3D12DevicePreview *linear_algebra_preview_device_ = nullptr;
+    ID3D12GraphicsCommandListPreview *linear_algebra_preview_command_list_ = nullptr;
+    uint32_t linear_algebra_tier_ = 0;
+    std::map<uint64_t, GfxLinearAlgebraOpSupport> linear_algebra_op_cache_;
     std::vector<IAmdExtD3DDevice1 *> amd_ext_devices_;
 
     HANDLE fence_event_ = {};
@@ -967,6 +978,9 @@ public:
                                  { gfx.handle = reinterpret_cast<uint64_t>(this); }
     ~GfxInternal() { terminate(); }
 
+    inline uint32_t getLinearAlgebraTier() const { return linear_algebra_tier_; }
+    inline bool linearAlgebraAvailable() const { return linear_algebra_tier_ != 0 && linear_algebra_preview_device_ != nullptr && linear_algebra_preview_command_list_ != nullptr; }
+
     GfxResult initialize(HWND window, GfxCreateContextFlags flags, IDXGIAdapter *adapter, GfxContext &context)
     {
         if(!window)
@@ -1315,6 +1329,19 @@ public:
         fence_values_ = (uint64_t *)gfxMalloc(max_frames_in_flight_ * sizeof(uint64_t));
         memset(fence_values_, 0, max_frames_in_flight_ * sizeof(uint64_t));
 
+        device_->QueryInterface(IID_PPV_ARGS(&linear_algebra_preview_device_));
+        if(!linear_algebra_preview_device_)
+            GFX_PRINTLN("Warning: ID3D12DevicePreview not available; linear algebra features disabled");
+        command_list_->QueryInterface(IID_PPV_ARGS(&linear_algebra_preview_command_list_));
+        if(!linear_algebra_preview_command_list_)
+            GFX_PRINTLN("Warning: ID3D12GraphicsCommandListPreview not available; matrix conversion disabled");
+        linear_algebra_tier_ = 0;
+        // Query the linear algebra tier (D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT = 77)
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linear_algebra_support{};
+        HRESULT const hr = device_->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT, &linear_algebra_support, sizeof(linear_algebra_support));
+        if(SUCCEEDED(hr))
+            linear_algebra_tier_ = static_cast<uint32_t>(linear_algebra_support.LinearAlgebraTier);
+
         return kGfxResult_NoError;
     }
 
@@ -1638,6 +1665,16 @@ public:
         {
             mesh_command_list_->Release();
             mesh_command_list_ = nullptr;
+        }
+        if(linear_algebra_preview_device_ != nullptr)
+        {
+            linear_algebra_preview_device_->Release();
+            linear_algebra_preview_device_ = nullptr;
+        }
+        if(linear_algebra_preview_command_list_ != nullptr)
+        {
+            linear_algebra_preview_command_list_->Release();
+            linear_algebra_preview_command_list_ = nullptr;
         }
         if(command_allocators_ != nullptr)
             for(uint32_t i = 0; i < max_frames_in_flight_; ++i)
@@ -5233,6 +5270,153 @@ public:
             return nullptr; // invalid buffer object
         Buffer const &gfx_buffer = buffers_[buffer];
         return gfx_buffer.resource_;
+    }
+
+    GfxResult linearAlgebraGetMatrixMemorySize(GfxLinearAlgebraMatrixDesc const &dst, uint64_t *out_size)
+    {
+        if(!linear_algebra_preview_device_ || linear_algebra_tier_ == 0)
+            return GFX_SET_ERROR(kGfxResult_InvalidOperation, "GPU linear algebra is not supported by this device");
+        if(!out_size)
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Null output pointer for linear algebra matrix size query");
+        if(dst.num_rows == 0 || dst.num_columns == 0)
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Zero matrix dimensions for linear algebra size query");
+
+        D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO dest_info{};
+        dest_info.DestLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(dst.layout);
+        dest_info.DestStride = dst.stride;
+        dest_info.NumRows = dst.num_rows;
+        dest_info.NumColumns = dst.num_columns;
+        dest_info.DestDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(dst.data_type);
+
+        linear_algebra_preview_device_->GetLinearAlgebraMatrixConversionDestinationInfo(&dest_info);
+        if(dest_info.DestSize == 0)
+            return GFX_SET_ERROR(kGfxResult_InvalidOperation, "Linear algebra layout/data type combination is not supported");
+        *out_size = dest_info.DestSize;
+        return kGfxResult_NoError;
+    }
+
+    GfxResult linearAlgebraConvertMatrix(GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer const &dst_buffer, uint64_t dst_offset,
+        GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view)
+    {
+        if(!linear_algebra_preview_command_list_ || linear_algebra_tier_ == 0)
+            return GFX_SET_ERROR(kGfxResult_InvalidOperation, "GPU linear algebra is not supported by this device");
+        if(!buffer_handles_.has_handle(dst_buffer.handle) || !buffer_handles_.has_handle(src_view.buffer.handle))
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Invalid buffer resource for matrix conversion");
+
+        uint64_t dst_size = 0;
+        GFX_TRY(linearAlgebraGetMatrixMemorySize(dst, &dst_size));
+        if(dst_offset + dst_size > dst_buffer.getSize())
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Destination matrix region exceeds buffer size");
+        if(src_view.offset + src_view.size > src_view.buffer.getSize())
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Source matrix region exceeds buffer size");
+
+        Buffer &gfx_dst = buffers_[dst_buffer];
+        Buffer &gfx_src = buffers_[src_view.buffer];
+        ID3D12Resource *dst_resource = gfx_dst.resource_;
+        ID3D12Resource *src_resource = gfx_src.resource_;
+        if(!dst_resource || !src_resource)
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Invalid buffer resource for matrix conversion");
+
+        // Transition resources for GPU matrix conversion
+        bool transitions = false;
+        transitions  = transitionResource(gfx_dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transitions |= transitionResource(gfx_src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if(transitions)
+            submitPipelineBarriers();
+
+        D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_INFO info{};
+        info.DestInfo.DestSize = (uint32_t)dst_size;
+        info.DestInfo.DestLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(dst.layout);
+        info.DestInfo.DestStride = dst.stride;
+        info.DestInfo.NumRows = dst.num_rows;
+        info.DestInfo.NumColumns = dst.num_columns;
+        info.DestInfo.DestDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(dst.data_type);
+        info.SrcInfo.SrcSize = (uint32_t)src_view.size;
+        info.SrcInfo.SrcDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(src.data_type);
+        info.SrcInfo.SrcLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(src.layout);
+        info.SrcInfo.SrcStride = src.stride;
+        info.DataDesc.DestVA = dst_resource->GetGPUVirtualAddress() + dst_offset;
+        info.DataDesc.SrcVA = src_resource->GetGPUVirtualAddress() + src_view.offset;
+
+        linear_algebra_preview_command_list_->ConvertLinearAlgebraMatrix(&info, 1);
+        return kGfxResult_NoError;
+    }
+
+    GfxLinearAlgebraMultiplySupport linearAlgebraGetMultiplyAddSupport(GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input,
+        GfxLinearAlgebraDataType bias_input, GfxLinearAlgebraDataType result)
+    {
+        GfxLinearAlgebraMultiplySupport support{};
+        if(!device_ || linear_algebra_tier_ == 0) return support;
+
+        uint64_t const cache_key = (uint64_t(D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_VECTOR_MATRIX_MULTIPLY) << 40) | (uint64_t(vector_input) << 30)
+            | (uint64_t(matrix_input) << 20) | (uint64_t(bias_input) << 10) | uint64_t(result);
+        auto const cached = linear_algebra_op_cache_.find(cache_key);
+        if(cached != linear_algebra_op_cache_.end())
+            return cached->second.multiply;
+
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT op_data{};
+        op_data.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_VECTOR_MATRIX_MULTIPLY;
+        op_data.ThreadVectorMatrixMultiply.VectorInputType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(vector_input);
+        op_data.ThreadVectorMatrixMultiply.MatrixInputType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(matrix_input);
+        op_data.ThreadVectorMatrixMultiply.BiasInputType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(bias_input);
+        op_data.ThreadVectorMatrixMultiply.VectorResultType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(result);
+        op_data.ThreadVectorMatrixMultiply.SupportFlags = D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_NONE;
+        if(SUCCEEDED(device_->CheckFeatureSupport(static_cast<D3D12_FEATURE>(78), &op_data, sizeof(op_data))))
+        {
+            auto const flags = op_data.ThreadVectorMatrixMultiply.SupportFlags;
+            support.supported = (flags & (D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED | D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_INPUTS)) != 0;
+            support.hardware_accelerated = support.supported
+                && !(flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_INPUTS)
+                && !(flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_OUTPUTS);
+            support.transpose_supported = (flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_TRANSPOSE) != 0;
+        }
+        linear_algebra_op_cache_.emplace(cache_key, GfxLinearAlgebraOpSupport{support, false, {}});
+        return support;
+    }
+
+    bool linearAlgebraGetOuterProductSupport(GfxLinearAlgebraDataType input_component, GfxLinearAlgebraDataType result_component)
+    {
+        if(!device_ || linear_algebra_tier_ == 0) return false;
+
+        uint64_t const cache_key = (uint64_t(D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_OUTER_PRODUCT) << 40) | (uint64_t(input_component) << 20) | uint64_t(result_component);
+        auto const cached = linear_algebra_op_cache_.find(cache_key);
+        if(cached != linear_algebra_op_cache_.end())
+            return cached->second.outer_product_supported;
+
+        bool supported = false;
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT op_data{};
+        op_data.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_OUTER_PRODUCT;
+        op_data.ThreadOuterProductSupport.InputComponentType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(input_component);
+        op_data.ThreadOuterProductSupport.ResultComponentType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(result_component);
+        op_data.ThreadOuterProductSupport.Supported = FALSE;
+        if(SUCCEEDED(device_->CheckFeatureSupport(static_cast<D3D12_FEATURE>(78), &op_data, sizeof(op_data))))
+            supported = op_data.ThreadOuterProductSupport.Supported != FALSE;
+        linear_algebra_op_cache_.emplace(cache_key, GfxLinearAlgebraOpSupport{{}, supported, {}});
+        return supported;
+    }
+
+    GfxLinearAlgebraAccumulationSupport linearAlgebraGetAccumulationSupport(GfxLinearAlgebraDataType component)
+    {
+        GfxLinearAlgebraAccumulationSupport support{};
+        if(!device_ || linear_algebra_tier_ == 0) return support;
+
+        uint64_t const cache_key = (uint64_t(D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_ATOMIC_ACCUMULATE_STORE) << 40) | uint64_t(component);
+        auto const cached = linear_algebra_op_cache_.find(cache_key);
+        if(cached != linear_algebra_op_cache_.end())
+            return cached->second.accumulation;
+
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT op_data{};
+        op_data.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_ATOMIC_ACCUMULATE_STORE;
+        op_data.AccumulateStore.ComponentType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(component);
+        op_data.AccumulateStore.RWByteAddressBufferSupported = FALSE;
+        op_data.AccumulateStore.GroupSharedSupported = FALSE;
+        if(SUCCEEDED(device_->CheckFeatureSupport(static_cast<D3D12_FEATURE>(78), &op_data, sizeof(op_data))))
+        {
+            support.rw_byte_address_buffer_supported = op_data.AccumulateStore.RWByteAddressBufferSupported != FALSE;
+            support.group_shared_supported = op_data.AccumulateStore.GroupSharedSupported != FALSE;
+        }
+        linear_algebra_op_cache_.emplace(cache_key, GfxLinearAlgebraOpSupport{{}, false, support});
+        return support;
     }
 
     ID3D12Resource *getTextureResource(GfxTexture const &texture)
@@ -11319,6 +11503,92 @@ GfxResult gfxFinish(GfxContext context)
     GfxInternal *gfx = GfxInternal::GetGfx(context);
     if(!gfx) return kGfxResult_InvalidParameter;
     return gfx->finish();
+}
+
+GfxLinearAlgebraTier gfxLinearAlgebraGetTier(GfxContext context)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return kGfxLinearAlgebraTier_NotSupported;
+    return static_cast<GfxLinearAlgebraTier>(gfx->getLinearAlgebraTier());
+}
+
+bool gfxLinearAlgebraIsAvailable(GfxContext context)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    return gfx && gfx->linearAlgebraAvailable();
+}
+
+char const *gfxLinearAlgebraGetTierName(GfxLinearAlgebraTier tier)
+{
+    switch(tier)
+    {
+    case kGfxLinearAlgebraTier_1_0:
+        return "TIER_1_0";
+    case kGfxLinearAlgebraTier_NotSupported:
+    default:
+        return "NOT_SUPPORTED";
+    }
+}
+
+char const *gfxLinearAlgebraGetDataTypeName(GfxLinearAlgebraDataType data_type)
+{
+    switch(data_type)
+    {
+    case kGfxLinearAlgebraDataType_Sint16:         return "SINT16";
+    case kGfxLinearAlgebraDataType_Uint16:         return "UINT16";
+    case kGfxLinearAlgebraDataType_Sint32:         return "SINT32";
+    case kGfxLinearAlgebraDataType_Uint32:         return "UINT32";
+    case kGfxLinearAlgebraDataType_Float16:        return "FLOAT16";
+    case kGfxLinearAlgebraDataType_Float32:        return "FLOAT32";
+    case kGfxLinearAlgebraDataType_PackedS8x32:    return "PACKED_S8X32";
+    case kGfxLinearAlgebraDataType_Sint8:          return "SINT8";
+    case kGfxLinearAlgebraDataType_Uint8:          return "UINT8";
+    case kGfxLinearAlgebraDataType_Float8E4m3Fn:   return "FLOAT8_E4M3FN";
+    case kGfxLinearAlgebraDataType_Float8E5m2:     return "FLOAT8_E5M2";
+    default:                                       return "UNKNOWN";
+    }
+}
+
+GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplySupport(GfxContext context, GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType result)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return {};
+    return gfx->linearAlgebraGetMultiplyAddSupport(vector_input, matrix_input, result, result);
+}
+
+GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplyAddSupport(GfxContext context, GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType bias_input, GfxLinearAlgebraDataType result)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return {};
+    return gfx->linearAlgebraGetMultiplyAddSupport(vector_input, matrix_input, bias_input, result);
+}
+
+bool gfxLinearAlgebraGetOuterProductSupport(GfxContext context, GfxLinearAlgebraDataType input_component, GfxLinearAlgebraDataType result_component)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return false;
+    return gfx->linearAlgebraGetOuterProductSupport(input_component, result_component);
+}
+
+GfxLinearAlgebraAccumulationSupport gfxLinearAlgebraGetAccumulationSupport(GfxContext context, GfxLinearAlgebraDataType component)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return {};
+    return gfx->linearAlgebraGetAccumulationSupport(component);
+}
+
+GfxResult gfxLinearAlgebraGetMatrixMemorySize(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, uint64_t *out_size)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return kGfxResult_InvalidParameter;
+    return gfx->linearAlgebraGetMatrixMemorySize(dst, out_size);
+}
+
+GfxResult gfxCommandConvertLinearAlgebraMatrix(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer dst_buffer, uint64_t dst_offset, GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return kGfxResult_InvalidParameter;
+    return gfx->linearAlgebraConvertMatrix(dst, dst_buffer, dst_offset, src, src_view);
 }
 
 GfxContext gfxCreateContext(ID3D12Device *device, uint32_t max_frames_in_flight)

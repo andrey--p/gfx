@@ -484,6 +484,148 @@ GfxResult gfxFrame(GfxContext context, bool vsync = true);
 GfxResult gfxFinish(GfxContext context);
 
 //!
+//! Linear algebra (D3D12 Preview API: GPU matrix layout conversion + cooperative vector operation support).
+//!
+//! These functions use the D3D12 Preview API (ID3D12DevicePreview / ID3D12GraphicsCommandListPreview) to query and
+//! perform GPU-accelerated matrix layout conversions for cooperative vector operations. The enum values below mirror
+//! the D3D12_LINEAR_ALGEBRA_* definitions; see the D3D12 headers for the driver-side semantics.
+//!
+
+//! GPU linear algebra capability tier (D3D12_LINEAR_ALGEBRA_TIER).
+enum GfxLinearAlgebraTier : uint32_t
+{
+    kGfxLinearAlgebraTier_NotSupported = 0,
+    kGfxLinearAlgebraTier_1_0          = 0x10
+};
+
+//! Matrix layout (D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT).
+enum GfxLinearAlgebraLayout : uint32_t
+{
+    kGfxLinearAlgebraLayout_RowMajor            = 0,
+    kGfxLinearAlgebraLayout_ColumnMajor         = 1,
+    kGfxLinearAlgebraLayout_MulOptimal          = 2,
+    kGfxLinearAlgebraLayout_OuterProductOptimal = 3
+};
+
+//! Matrix element data type (D3D12_LINEAR_ALGEBRA_DATATYPE).
+enum GfxLinearAlgebraDataType : uint32_t
+{
+    kGfxLinearAlgebraDataType_Sint16        = 2,
+    kGfxLinearAlgebraDataType_Uint16        = 3,
+    kGfxLinearAlgebraDataType_Sint32        = 4,
+    kGfxLinearAlgebraDataType_Uint32        = 5,
+    kGfxLinearAlgebraDataType_Float16       = 7,
+    kGfxLinearAlgebraDataType_Float32       = 8,
+    kGfxLinearAlgebraDataType_PackedS8x32   = 17,
+    kGfxLinearAlgebraDataType_Sint8         = 18,
+    kGfxLinearAlgebraDataType_Uint8         = 19,
+    kGfxLinearAlgebraDataType_Float8E4m3Fn  = 20,
+    kGfxLinearAlgebraDataType_Float8E5m2    = 21
+};
+
+//! Descriptor of a matrix used by a linear algebra operation.
+struct GfxLinearAlgebraMatrixDesc
+{
+    uint32_t num_rows = 0;
+    uint32_t num_columns = 0;
+    GfxLinearAlgebraLayout layout = kGfxLinearAlgebraLayout_RowMajor;
+    GfxLinearAlgebraDataType data_type = kGfxLinearAlgebraDataType_Float32;
+    uint32_t stride = 0; //! 0 = driver default
+};
+
+//! A region of a GfxBuffer holding a matrix.
+struct GfxLinearAlgebraBufferView
+{
+    GfxBuffer buffer = {};
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+
+//! Support of a vector-matrix multiply (bias = result type).
+struct GfxLinearAlgebraMultiplySupport
+{
+    bool supported = false;
+    bool hardware_accelerated = false;
+    bool transpose_supported = false;
+};
+
+//! Support of an atomic accumulate store.
+struct GfxLinearAlgebraAccumulationSupport
+{
+    bool rw_byte_address_buffer_supported = false;
+    bool group_shared_supported = false;
+};
+
+//! Get the GPU linear algebra tier (kGfxLinearAlgebraTier_NotSupported for a null context or an unsupported device).
+GfxLinearAlgebraTier gfxLinearAlgebraGetTier(GfxContext context);
+
+//! True if linear algebra commands can be recorded and submitted (tier, device and command list Preview interfaces).
+bool gfxLinearAlgebraIsAvailable(GfxContext context);
+
+//! Get a human-readable tier name.
+char const *gfxLinearAlgebraGetTierName(GfxLinearAlgebraTier tier);
+
+//! Get a human-readable data type name.
+char const *gfxLinearAlgebraGetDataTypeName(GfxLinearAlgebraDataType data_type);
+
+//! Check vector-matrix multiply support for a data type combination (bias type = result type).
+GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplySupport(GfxContext context, GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType result);
+
+//! Check vector-matrix multiply+add support for a data type combination.
+GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplyAddSupport(GfxContext context, GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType bias_input, GfxLinearAlgebraDataType result);
+
+//! Check outer product support for a data type combination.
+bool gfxLinearAlgebraGetOuterProductSupport(GfxContext context, GfxLinearAlgebraDataType input_component, GfxLinearAlgebraDataType result_component);
+
+//! Check atomic accumulate store support for a data type.
+GfxLinearAlgebraAccumulationSupport gfxLinearAlgebraGetAccumulationSupport(GfxContext context, GfxLinearAlgebraDataType component);
+
+//! Query the destination size in bytes required to store a matrix described by dst.
+//! Returns kGfxResult_UnsupportedOperation if the device does not support the layout/data type combination.
+GfxResult gfxLinearAlgebraGetMatrixMemorySize(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, uint64_t *out_size);
+
+//! Record a ConvertLinearAlgebraMatrix command converting a matrix from src in src_view to the layout/data type
+//! of dst at dst_offset of dst_buffer; the caller must submit the command list. The destination size is computed
+//! from dst; both regions are range-checked against their buffers.
+GfxResult gfxCommandConvertLinearAlgebraMatrix(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer dst_buffer, uint64_t dst_offset, GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view);
+
+//! Map a host scalar type to its GfxLinearAlgebraDataType (float, int8_t ... uint32_t).
+template<typename TYPE>
+GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf()
+{
+    static_assert(sizeof(TYPE) == 0, "gfxLinearAlgebraDataTypeOf: unsupported host type");
+    return kGfxLinearAlgebraDataType_Float32;
+}
+
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<float>()    { return kGfxLinearAlgebraDataType_Float32; }
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<int8_t>()   { return kGfxLinearAlgebraDataType_Sint8; }
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<uint8_t>()  { return kGfxLinearAlgebraDataType_Uint8; }
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<int16_t>()  { return kGfxLinearAlgebraDataType_Sint16; }
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<uint16_t>() { return kGfxLinearAlgebraDataType_Uint16; }
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<int32_t>()  { return kGfxLinearAlgebraDataType_Sint32; }
+template<> inline GfxLinearAlgebraDataType gfxLinearAlgebraDataTypeOf<uint32_t>() { return kGfxLinearAlgebraDataType_Uint32; }
+
+//! Record a GPU conversion of a row-major num_rows x num_columns matrix of elements TYPE from src_buffer at
+//! src_offset to the layout/data type of dst at dst_offset of dst_buffer. The regions must not overlap.
+template<typename TYPE>
+GfxResult gfxLinearAlgebraConvertRowMajor(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer dst_buffer, uint64_t dst_offset, GfxBuffer src_buffer, uint64_t src_offset, uint32_t num_rows, uint32_t num_columns)
+{
+    GfxLinearAlgebraMatrixDesc src;
+    src.num_rows = num_rows;
+    src.num_columns = num_columns;
+    src.layout = kGfxLinearAlgebraLayout_RowMajor;
+    src.data_type = gfxLinearAlgebraDataTypeOf<TYPE>();
+    src.stride = (uint32_t)(num_columns * sizeof(TYPE));
+
+    GfxLinearAlgebraBufferView src_view;
+    src_view.buffer = src_buffer;
+    src_view.offset = src_offset;
+    src_view.size = (uint64_t)num_rows * num_columns * sizeof(TYPE);
+
+    return gfxCommandConvertLinearAlgebraMatrix(context, dst, dst_buffer, dst_offset, src, src_view);
+}
+
+//!
 //! Interop interface.
 //!
 
