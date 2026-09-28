@@ -484,7 +484,7 @@ GfxResult gfxFrame(GfxContext context, bool vsync = true);
 GfxResult gfxFinish(GfxContext context);
 
 //!
-//! Linear algebra (D3D12 Preview API: GPU matrix layout conversion + cooperative vector operation support).
+//! Linear algebra (D3D12 Preview API: GPU matrix layout conversion + linear algebra operation support).
 //!
 
 enum GfxLinearAlgebraTier : uint32_t
