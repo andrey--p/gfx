@@ -5302,6 +5302,8 @@ public:
             return GFX_SET_ERROR(kGfxResult_InvalidOperation, "GPU linear algebra is not supported by this device");
         if(!buffer_handles_.has_handle(dst_buffer.handle) || !buffer_handles_.has_handle(src_view.buffer.handle))
             return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Invalid buffer resource for matrix conversion");
+        if(src.num_rows == 0 || src.num_columns == 0 || src.num_rows != dst.num_rows || src.num_columns != dst.num_columns)
+            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Source and destination matrix dimensions must match for linear algebra matrix conversion");
 
         uint64_t dst_size = 0;
         GFX_TRY(linearAlgebraGetMatrixMemorySize(dst, &dst_size));
@@ -5316,6 +5318,8 @@ public:
         ID3D12Resource *src_resource = gfx_src.resource_;
         if(!dst_resource || !src_resource)
             return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Invalid buffer resource for matrix conversion");
+        if(gfx_dst.resource_ == gfx_src.resource_)
+            return GFX_SET_ERROR(kGfxResult_InvalidOperation, "Cannot convert between two matrix regions that are pointing at the same resource; use an intermediate buffer");
 
         // Transition resources for GPU matrix conversion
         bool transitions = false;
@@ -5361,7 +5365,7 @@ public:
         op_data.ThreadVectorMatrixMultiply.BiasInputType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(bias_input);
         op_data.ThreadVectorMatrixMultiply.VectorResultType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(result);
         op_data.ThreadVectorMatrixMultiply.SupportFlags = D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_NONE;
-        if(SUCCEEDED(device_->CheckFeatureSupport(static_cast<D3D12_FEATURE>(78), &op_data, sizeof(op_data))))
+        if(SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT, &op_data, sizeof(op_data))))
         {
             auto const flags = op_data.ThreadVectorMatrixMultiply.SupportFlags;
             support.supported = (flags & (D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED | D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_INPUTS)) != 0;
@@ -5389,7 +5393,7 @@ public:
         op_data.ThreadOuterProductSupport.InputComponentType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(input_component);
         op_data.ThreadOuterProductSupport.ResultComponentType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(result_component);
         op_data.ThreadOuterProductSupport.Supported = FALSE;
-        if(SUCCEEDED(device_->CheckFeatureSupport(static_cast<D3D12_FEATURE>(78), &op_data, sizeof(op_data))))
+        if(SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT, &op_data, sizeof(op_data))))
             supported = op_data.ThreadOuterProductSupport.Supported != FALSE;
         linear_algebra_op_cache_.emplace(cache_key, GfxLinearAlgebraOpSupport{{}, supported, {}});
         return supported;
@@ -5410,7 +5414,7 @@ public:
         op_data.AccumulateStore.ComponentType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(component);
         op_data.AccumulateStore.RWByteAddressBufferSupported = FALSE;
         op_data.AccumulateStore.GroupSharedSupported = FALSE;
-        if(SUCCEEDED(device_->CheckFeatureSupport(static_cast<D3D12_FEATURE>(78), &op_data, sizeof(op_data))))
+        if(SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT, &op_data, sizeof(op_data))))
         {
             support.rw_byte_address_buffer_supported = op_data.AccumulateStore.RWByteAddressBufferSupported != FALSE;
             support.group_shared_supported = op_data.AccumulateStore.GroupSharedSupported != FALSE;
