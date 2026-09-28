@@ -545,16 +545,71 @@ struct GfxLinearAlgebraAccumulationSupport
     bool group_shared_supported = false;
 };
 
+//! Get the linear algebra capability tier of the device (D3D12_LINEAR_ALGEBRA_TIER, probed through
+//! D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT when the context created its own device). Returns
+//! kGfxLinearAlgebraTier_NotSupported for a null context, a device without linear algebra support, or a
+//! context created around an externally supplied device, which does not probe the feature. The tier is
+//! informational only; gate command recording on gfxLinearAlgebraIsAvailable.
 GfxLinearAlgebraTier gfxLinearAlgebraGetTier(GfxContext context);
+
+//! True if linear algebra commands can be recorded on this context: the device reports a non-zero linear
+//! algebra tier and both ID3D12DevicePreview and ID3D12GraphicsCommandListPreview were acquired from the
+//! device and command list at context creation. This is the recommended gate before calling the
+//! gfxLinearAlgebra* query functions and gfxCommandConvertLinearAlgebraMatrix.
 bool gfxLinearAlgebraIsAvailable(GfxContext context);
+
+//! Get a human-readable tier name ("TIER_1_0", "NOT_SUPPORTED"; unknown values map to "NOT_SUPPORTED").
+//! Does not require a context.
 char const *gfxLinearAlgebraGetTierName(GfxLinearAlgebraTier tier);
+
+//! Get a human-readable data type name matching the D3D12_LINEAR_ALGEBRA_DATATYPE spelling
+//! ("SINT16" ... "FLOAT8_E5M2"; unknown values map to "UNKNOWN"). Does not require a context.
 char const *gfxLinearAlgebraGetDataTypeName(GfxLinearAlgebraDataType data_type);
-GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplySupport(GfxContext context, GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType result);
-GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplyAddSupport(GfxContext context, GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType bias_input, GfxLinearAlgebraDataType result);
+
+//! Query device support for the thread vector-matrix multiply without bias of the given type combination
+//! (vector x matrix -> vector); this maps to gfxLinearAlgebraGetMultiplyAddSupport with bias_input = result.
+//! Returns supported (driver support, including emulated inputs), hardware_accelerated (no input or output
+//! emulation) and transpose_supported. All fields are false for a null context or an unsupported device.
+//! Results are cached per type combination.
+GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplySupport(GfxContext context,
+    GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType result);
+
+//! Query device support for the thread vector-matrix multiply with bias add of the given type combination
+//! (vector x matrix + bias -> vector) through
+//! D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT. Returns supported (driver support,
+//! including emulated inputs), hardware_accelerated (no input or output emulation) and transpose_supported.
+//! All fields are false for a null context or an unsupported device. Results are cached per type combination.
+GfxLinearAlgebraMultiplySupport gfxLinearAlgebraGetMultiplyAddSupport(GfxContext context,
+    GfxLinearAlgebraDataType vector_input, GfxLinearAlgebraDataType matrix_input, GfxLinearAlgebraDataType bias_input, GfxLinearAlgebraDataType result);
+
+//! Query device support for the thread outer product of the given component type combination
+//! (input_component x input_component -> result_component). Returns false for a null context or an
+//! unsupported device. Results are cached per type combination.
 bool gfxLinearAlgebraGetOuterProductSupport(GfxContext context, GfxLinearAlgebraDataType input_component, GfxLinearAlgebraDataType result_component);
+
+//! Query device support for the atomic accumulate store of the given component type. Reports whether the
+//! accumulation can target an RW byte address buffer and/or thread group shared memory. All fields are
+//! false for a null context or an unsupported device. Results are cached per component type.
 GfxLinearAlgebraAccumulationSupport gfxLinearAlgebraGetAccumulationSupport(GfxContext context, GfxLinearAlgebraDataType component);
+
+//! Query the size in bytes required to store a matrix described by dst in the driver's destination format
+//! (layout, stride, 0 = driver default, and data type) through GetLinearAlgebraMatrixConversionDestinationInfo.
+//! Returns kGfxResult_InvalidParameter for a null out_size or zero matrix dimensions, and
+//! kGfxResult_InvalidOperation if the device does not support linear algebra or rejects the layout/data
+//! type combination (driver-reported size of 0).
 GfxResult gfxLinearAlgebraGetMatrixMemorySize(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, uint64_t *out_size);
-GfxResult gfxCommandConvertLinearAlgebraMatrix(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer dst_buffer, uint64_t dst_offset, GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view);
+
+//! Record a GPU matrix conversion (ConvertLinearAlgebraMatrix) converting the matrix in src_view (src
+//! layout/data type) into the layout/data type described by dst at dst_offset of dst_buffer. The src and
+//! dst dimensions (num_rows/num_columns) must match, both regions must fit their buffers, and dst_buffer
+//! and src_view.buffer must be different resources (regions on the same resource are rejected, use an
+//! intermediate buffer); the destination size is computed from dst. On success the command is appended to
+//! the context command list, which the caller must submit (gfxExecute), and the buffers are transitioned
+//! to UNORDERED_ACCESS (dst) and NON_PIXEL_SHADER_RESOURCE (src) respectively; transition them back before
+//! other uses. Returns kGfxResult_InvalidOperation when linear algebra is unavailable or the regions share
+//! a resource, kGfxResult_InvalidParameter for invalid buffers, mismatched dimensions or out-of-range regions.
+GfxResult gfxCommandConvertLinearAlgebraMatrix(GfxContext context,
+    GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer dst_buffer, uint64_t dst_offset, GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view);
 
 //!
 //! Interop interface.
