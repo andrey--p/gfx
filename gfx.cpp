@@ -5272,77 +5272,87 @@ public:
         return gfx_buffer.resource_;
     }
 
-    GfxResult linearAlgebraGetMatrixMemorySize(GfxLinearAlgebraMatrixDesc const &dst, uint64_t *out_size)
+    GfxResult linearAlgebraGetMatrixMemorySize(GfxLinearAlgebraMatrixDesc const& matrix_desc, GfxLinearAlgebraBufferView const& buffer_view_dst, uint64_t& size)
     {
         if(!linear_algebra_preview_device_ || linear_algebra_tier_ == 0)
             return GFX_SET_ERROR(kGfxResult_InvalidOperation, "GPU linear algebra is not supported by this device");
-        if(!out_size)
-            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Null output pointer for linear algebra matrix size query");
-        if(dst.num_rows == 0 || dst.num_columns == 0)
+        if(matrix_desc.rows == 0 || matrix_desc.columns == 0)
             return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Zero matrix dimensions for linear algebra size query");
 
         D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO dest_info{};
-        dest_info.DestLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(dst.layout);
-        dest_info.DestStride = dst.stride;
-        dest_info.NumRows = dst.num_rows;
-        dest_info.NumColumns = dst.num_columns;
-        dest_info.DestDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(dst.data_type);
+        dest_info.DestLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(buffer_view_dst.layout);
+        dest_info.DestStride = buffer_view_dst.stride;
+        dest_info.NumRows = matrix_desc.rows;
+        dest_info.NumColumns = matrix_desc.columns;
+        dest_info.DestDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(buffer_view_dst.data_type);
 
         linear_algebra_preview_device_->GetLinearAlgebraMatrixConversionDestinationInfo(&dest_info);
         if(dest_info.DestSize == 0)
             return GFX_SET_ERROR(kGfxResult_InvalidOperation, "Linear algebra layout/data type combination is not supported");
-        *out_size = dest_info.DestSize;
+        size = dest_info.DestSize;
         return kGfxResult_NoError;
     }
 
-    GfxResult linearAlgebraConvertMatrix(GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer const &dst_buffer, uint64_t dst_offset,
-        GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view)
+    GfxResult linearAlgebraConvertMatricies(std::vector<GfxLinearAlgebraMatrixCB> const& matrix_cb_arr, GfxBuffer buffer_src, GfxBuffer buffer_dst)
     {
         if(!linear_algebra_preview_command_list_ || linear_algebra_tier_ == 0)
             return GFX_SET_ERROR(kGfxResult_InvalidOperation, "GPU linear algebra is not supported by this device");
-        if(!buffer_handles_.has_handle(dst_buffer.handle) || !buffer_handles_.has_handle(src_view.buffer.handle))
+        if(!buffer_handles_.has_handle(buffer_src.handle) || !buffer_handles_.has_handle(buffer_dst.handle))
             return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Invalid buffer resource for matrix conversion");
-        if(src.num_rows == 0 || src.num_columns == 0 || src.num_rows != dst.num_rows || src.num_columns != dst.num_columns)
-            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Source and destination matrix dimensions must match for linear algebra matrix conversion");
+        for (auto& matrix_cb_entry : matrix_cb_arr)
+        {
+            if (matrix_cb_entry.matrix.rows == 0 || matrix_cb_entry.matrix.columns == 0)
+                return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Zero matrix dimensions for linear algebra size query");
 
-        uint64_t dst_size = 0;
-        GFX_TRY(linearAlgebraGetMatrixMemorySize(dst, &dst_size));
-        if(dst_offset + dst_size > dst_buffer.getSize())
-            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Destination matrix region exceeds buffer size");
-        if(src_view.offset + src_view.size > src_view.buffer.getSize())
-            return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Source matrix region exceeds buffer size");
+            if ((matrix_cb_entry.buffer_view.src.offset + matrix_cb_entry.buffer_view.src.size) > buffer_src.getSize())
+                return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Source matrix region exceeds buffer size");
+            if ((matrix_cb_entry.buffer_view.dst.offset + matrix_cb_entry.buffer_view.dst.size) > buffer_dst.getSize())
+                return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Destination matrix region exceeds buffer size");
+        }
 
-        Buffer &gfx_dst = buffers_[dst_buffer];
-        Buffer &gfx_src = buffers_[src_view.buffer];
-        ID3D12Resource *dst_resource = gfx_dst.resource_;
-        ID3D12Resource *src_resource = gfx_src.resource_;
-        if(!dst_resource || !src_resource)
+        Buffer& gfx_dst = buffers_[buffer_dst];
+        Buffer& gfx_src = buffers_[buffer_src];
+        ID3D12Resource* dst_resource = gfx_dst.resource_;
+        ID3D12Resource* src_resource = gfx_src.resource_;
+        if (!dst_resource || !src_resource)
             return GFX_SET_ERROR(kGfxResult_InvalidParameter, "Invalid buffer resource for matrix conversion");
-        if(gfx_dst.resource_ == gfx_src.resource_)
+        if (gfx_dst.resource_ == gfx_src.resource_)
             return GFX_SET_ERROR(kGfxResult_InvalidOperation, "Cannot convert between two matrix regions that are pointing at the same resource; use an intermediate buffer");
 
         // Transition resources for GPU matrix conversion
         bool transitions = false;
-        transitions  = transitionResource(gfx_dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transitions = transitionResource(gfx_dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         transitions |= transitionResource(gfx_src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        if(transitions)
+        if (transitions)
             submitPipelineBarriers();
 
-        D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_INFO info{};
-        info.DestInfo.DestSize = (uint32_t)dst_size;
-        info.DestInfo.DestLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(dst.layout);
-        info.DestInfo.DestStride = dst.stride;
-        info.DestInfo.NumRows = dst.num_rows;
-        info.DestInfo.NumColumns = dst.num_columns;
-        info.DestInfo.DestDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(dst.data_type);
-        info.SrcInfo.SrcSize = (uint32_t)src_view.size;
-        info.SrcInfo.SrcDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(src.data_type);
-        info.SrcInfo.SrcLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(src.layout);
-        info.SrcInfo.SrcStride = src.stride;
-        info.DataDesc.DestVA = dst_resource->GetGPUVirtualAddress() + dst_offset;
-        info.DataDesc.SrcVA = src_resource->GetGPUVirtualAddress() + src_view.offset;
+        std::vector<D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_INFO> info;
+        info.reserve(matrix_cb_arr.size());
+        for (auto& matrix_cb_entry : matrix_cb_arr)
+        {
+            info.push_back({
+                .DestInfo = {
+                    .DestSize = (uint32_t)matrix_cb_entry.buffer_view.dst.size,
+                    .DestLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(matrix_cb_entry.buffer_view.dst.layout),
+                    .DestStride = matrix_cb_entry.buffer_view.dst.stride,
+                    .NumRows = matrix_cb_entry.matrix.rows,
+                    .NumColumns = matrix_cb_entry.matrix.columns,
+                    .DestDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(matrix_cb_entry.buffer_view.dst.data_type)
+                },
+                .SrcInfo = {
+                    .SrcSize = (uint32_t)matrix_cb_entry.buffer_view.src.size,
+                    .SrcDataType = static_cast<D3D12_LINEAR_ALGEBRA_DATATYPE>(matrix_cb_entry.buffer_view.src.data_type),
+                    .SrcLayout = static_cast<D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT>(matrix_cb_entry.buffer_view.src.layout),
+                    .SrcStride = matrix_cb_entry.buffer_view.src.stride
+                },
+                .DataDesc = {
+                    .DestVA = dst_resource->GetGPUVirtualAddress() + matrix_cb_entry.buffer_view.dst.offset,
+                    .SrcVA = src_resource->GetGPUVirtualAddress() + matrix_cb_entry.buffer_view.src.offset
+                }
+            });
+        }
 
-        linear_algebra_preview_command_list_->ConvertLinearAlgebraMatrix(&info, 1);
+        linear_algebra_preview_command_list_->ConvertLinearAlgebraMatrix(info.data(), (uint32_t)info.size());
         return kGfxResult_NoError;
     }
 
@@ -11581,18 +11591,18 @@ GfxLinearAlgebraAccumulationSupport gfxLinearAlgebraGetAccumulationSupport(GfxCo
     return gfx->linearAlgebraGetAccumulationSupport(component);
 }
 
-GfxResult gfxLinearAlgebraGetMatrixMemorySize(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, uint64_t *out_size)
+GfxResult gfxLinearAlgebraGetMatrixMemorySize(GfxContext context, GfxLinearAlgebraMatrixDesc const& matrix_desc, GfxLinearAlgebraBufferView const& buffer_view_dst, uint64_t& size)
 {
     GfxInternal *gfx = GfxInternal::GetGfx(context);
     if(!gfx) return kGfxResult_InvalidParameter;
-    return gfx->linearAlgebraGetMatrixMemorySize(dst, out_size);
+    return gfx->linearAlgebraGetMatrixMemorySize(matrix_desc, buffer_view_dst, size);
 }
 
-GfxResult gfxCommandConvertLinearAlgebraMatrix(GfxContext context, GfxLinearAlgebraMatrixDesc const &dst, GfxBuffer dst_buffer, uint64_t dst_offset, GfxLinearAlgebraMatrixDesc const &src, GfxLinearAlgebraBufferView const &src_view)
+GfxResult gfxCommandConvertLinearAlgebraMatricies(GfxContext context, std::vector<GfxLinearAlgebraMatrixCB> const& matrix_cb_arr, GfxBuffer buffer_src, GfxBuffer buffer_dst)
 {
     GfxInternal *gfx = GfxInternal::GetGfx(context);
     if(!gfx) return kGfxResult_InvalidParameter;
-    return gfx->linearAlgebraConvertMatrix(dst, dst_buffer, dst_offset, src, src_view);
+    return gfx->linearAlgebraConvertMatricies(matrix_cb_arr, buffer_src, buffer_dst);
 }
 
 GfxContext gfxCreateContext(ID3D12Device *device, uint32_t max_frames_in_flight)
